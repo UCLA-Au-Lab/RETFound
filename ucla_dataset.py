@@ -1,7 +1,5 @@
 import torch
 import numpy as np
-import torchvision as tv
-import zarr
 
 class UCLA_b_scans(torch.utils.data.Dataset):
     def __init__(self, groups, oct_key="volume", emb_key="RETFound_mae_natureOCT", transforms=None):
