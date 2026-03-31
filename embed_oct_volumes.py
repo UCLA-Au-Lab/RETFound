@@ -38,9 +38,9 @@ import zarr
 from einops import rearrange
 from functools import partial
 from huggingface_hub import hf_hub_download
-from PIL import Image
 
 import models_vit as models
+from ucla_dataset import preprocess_bscan, UCLA_b_scans
 
 
 # ---------------------------------------------------------------------------
@@ -68,75 +68,29 @@ def load_retfound_oct(device: torch.device) -> nn.Module:
 
 
 # ---------------------------------------------------------------------------
-# Preprocessing
-# ---------------------------------------------------------------------------
-
-def preprocess_bscan(bscan: np.ndarray) -> np.ndarray:
-    """
-    Convert a single 2D B-scan to a (224, 224, 3) float32 array ready for
-    the model.
-
-    Accepts:
-        (C, H, W)    – channel-first (C=1 or C=3)
-        (H, W)       – grayscale
-        (H, W, 3)    – channel-last RGB
-
-    Returns:
-        float32 array of shape (224, 224, 3), per-channel z-score normalised
-    """
-    arr = bscan.astype(np.float32)
-
-    # channel-first → channel-last
-    if arr.ndim == 3 and arr.shape[0] in (1, 3):
-        arr = arr.transpose(1, 2, 0)  # (C, H, W) → (H, W, C)
-
-    if arr.ndim == 3 and arr.shape[2] == 1:
-        arr = arr[..., 0]  # (H, W, 1) → (H, W)
-
-    if arr.ndim == 2:
-        # grayscale → replicate to 3 channels
-        pil = Image.fromarray(
-            np.clip(arr / arr.max() * 255, 0, 255).astype(np.uint8)
-            if arr.max() > 0 else arr.astype(np.uint8),
-            mode="L",
-        ).convert("RGB")
-    else:
-        # already 3-channel
-        pil = Image.fromarray(
-            np.clip(arr / arr.max() * 255, 0, 255).astype(np.uint8)
-            if arr.max() > 0 else arr.astype(np.uint8)
-        )
-
-    pil = pil.resize((224, 224), Image.BICUBIC)
-    img = np.array(pil).astype(np.float64) / 255.0  # (224, 224, 3) in [0, 1]
-
-    # per-channel z-score (match latent_feature.ipynb)
-    for c in range(3):
-        std = img[..., c].std()
-        if std > 0:
-            img[..., c] = (img[..., c] - img[..., c].mean()) / std
-        else:
-            img[..., c] = img[..., c] - img[..., c].mean()
-
-    return img.astype(np.float32)
-
-
-# ---------------------------------------------------------------------------
 # Embedding
 # ---------------------------------------------------------------------------
 
-class BscanDataset(torch.utils.data.Dataset):
-    """Wraps a (D, *) volume array; returns preprocessed (3, 224, 224) tensors."""
+class _BscanDataset(torch.utils.data.Dataset):
+    """Internal dataset for embed_volume: wraps a single (D, *) volume."""
 
     def __init__(self, vol_d_first: np.ndarray) -> None:
-        self.vol = vol_d_first  # (D, *remaining dims)
+        self.vol = vol_d_first
 
     def __len__(self) -> int:
         return self.vol.shape[0]
 
     def __getitem__(self, idx: int) -> torch.Tensor:
-        arr = preprocess_bscan(self.vol[idx])            # (224, 224, 3) float32
+        arr = preprocess_bscan(self.vol[idx])            # (224, 224, 3)
         return torch.from_numpy(arr).permute(2, 0, 1)   # (3, 224, 224)
+
+
+def _collate_bscans(batch):
+    """Collate that stacks tensors but keeps zarr arrays as a plain list."""
+    b_scans = torch.stack([item[0] for item in batch])
+    emb_arrays = [item[1] for item in batch]
+    b_indices = torch.tensor([item[2] for item in batch], dtype=torch.long)
+    return b_scans, emb_arrays, b_indices
 
 
 def embed_volume(
@@ -165,7 +119,6 @@ def embed_volume(
         - ``"e"``   → mean-pooled volume embedding, shape ``(1024,)``
     num_workers : int
         DataLoader worker processes for parallel B-scan preprocessing (default 4).
-        Set to 0 to preprocess in the main process.
 
     Returns
     -------
@@ -186,7 +139,7 @@ def embed_volume(
     vol_d_first = rearrange(vol, f'{in_dims} -> d {" ".join(remaining)}')
 
     loader = torch.utils.data.DataLoader(
-        BscanDataset(vol_d_first),
+        _BscanDataset(vol_d_first),
         batch_size=batch_size,
         num_workers=num_workers,
         pin_memory=(device.type == "cuda"),
@@ -195,8 +148,8 @@ def embed_volume(
     all_embeddings = []
     with torch.no_grad():
         for batch in loader:
-            x = batch.to(device)                         # (B, 3, 224, 224)
-            latent = model.forward_features(x.float())   # (B, 1, 1024)
+            x = batch.to(device)
+            latent = model.forward_features(x.float())
             all_embeddings.append(latent.squeeze(1).cpu().float().numpy())
 
     slice_embs = np.concatenate(all_embeddings, axis=0)  # (D, 1024)
@@ -226,33 +179,34 @@ def embed_zarr_groups(
     """
     Embed OCT volumes stored inside zarr groups and write results back in-place.
 
-    For each group, reads the array at ``oct_key``, embeds it with RETFound,
-    and saves the result under ``emb_key`` in the same group.
+    For ``out_dims="d e"``, uses ``UCLA_b_scans`` to batch B-scans across all
+    volumes simultaneously, writing each slice embedding back as it is produced.
+
+    For ``out_dims="e"``, processes each volume independently and writes the
+    mean-pooled ``(1024,)`` embedding when the volume is complete.
 
     Parameters
     ----------
     groups : list[zarr.Group]
         Open zarr groups, each containing an OCT volume at ``oct_key``.
-        Groups must be opened with write access (mode ``"r+"`` or ``"a"``).
+        Must be opened with write access (mode ``"r+"`` or ``"a"``).
     model : nn.Module
         Loaded RETFound model (e.g. from ``load_retfound_oct``).
     oct_key : str
         Key of the OCT volume array inside each group, e.g. ``"oct"``.
+        Array must have shape ``(C, D, H, W)``.
     emb_key : str
         Key under which the embedding array will be written, e.g. ``"oct_emb"``.
     in_dims : str
-        Einops-style axis names for the OCT array, e.g. ``"c d h w"``.
-        Must contain ``'d'`` for the B-scan axis.
+        Einops-style axis names for the OCT array (default ``"c d h w"``).
+        Only used for ``out_dims="e"``; ``UCLA_b_scans`` always assumes axis 1 is D.
     out_dims : str
-        Shape of the written embedding:
-
-        - ``"d e"`` → per-slice, shape ``(D, 1024)``  *(default)*
-        - ``"e"``   → mean-pooled, shape ``(1024,)``
+        - ``"d e"`` → per-slice ``(D, 1024)`` written incrementally  *(default)*
+        - ``"e"``   → mean-pooled ``(1024,)`` written per volume
     batch_size : int
         B-scans per forward pass (default 32).
     num_workers : int
-        DataLoader worker processes for parallel B-scan preprocessing (default 4).
-        Set to 0 to preprocess in the main process.
+        DataLoader worker processes for B-scan preprocessing (default 4).
     device : torch.device, optional
         Defaults to CUDA if available, otherwise CPU.
     overwrite : bool
@@ -261,19 +215,37 @@ def embed_zarr_groups(
     if device is None:
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-    for i, group in enumerate(groups):
-        if emb_key in group and not overwrite:
-            print(f"[{i}] skipping – '{emb_key}' already exists")
-            continue
+    pending = [g for g in groups if overwrite or emb_key not in g]
+    skipped = len(groups) - len(pending)
+    if skipped:
+        print(f"Skipping {skipped} group(s) where '{emb_key}' already exists")
+    if not pending:
+        return
 
-        if oct_key not in group:
-            raise KeyError(f"[{i}] '{oct_key}' not found in group {group.name!r}")
+    if out_dims == "d e":
+        dataset = UCLA_b_scans(pending, oct_key=oct_key, emb_key=emb_key, out_dims=out_dims)
+        loader = torch.utils.data.DataLoader(
+            dataset,
+            batch_size=batch_size,
+            num_workers=num_workers,
+            pin_memory=(device.type == "cuda"),
+            collate_fn=_collate_bscans,
+        )
+        with torch.no_grad():
+            for b_scans, emb_arrays, b_indices in loader:
+                x = b_scans.to(device)
+                latent = model.forward_features(x.float()).squeeze(1)  # (B, 1024)
+                latent_np = latent.cpu().float().numpy()
+                for emb, arr, b in zip(latent_np, emb_arrays, b_indices.tolist()):
+                    arr[b] = emb
+        print(f"Embedded {len(pending)} volume(s) → '{emb_key}' (D, 1024)")
 
-        vol = np.array(group[oct_key])
-        emb = embed_volume(model, vol, in_dims, out_dims, batch_size, device, num_workers)
-
-        group[emb_key] = emb
-        print(f"[{i}] wrote {emb_key!r} {emb.shape} → {group.name!r}")
+    else:  # "e"
+        for i, group in enumerate(pending):
+            vol = np.array(group[oct_key])
+            emb = embed_volume(model, vol, in_dims, out_dims, batch_size, device, num_workers)
+            group[emb_key] = emb
+            print(f"[{i}] wrote '{emb_key}' {emb.shape} → {group.name!r}")
 
 
 # ---------------------------------------------------------------------------
