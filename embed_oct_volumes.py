@@ -175,7 +175,6 @@ def embed_zarr_groups(
     batch_size: int = 32,
     num_workers: int = 4,
     device: torch.device | None = None,
-    overwrite: bool = False,
 ) -> None:
     """
     Embed OCT volumes stored inside zarr groups and write results back in-place.
@@ -210,21 +209,12 @@ def embed_zarr_groups(
         DataLoader worker processes for B-scan preprocessing (default 4).
     device : torch.device, optional
         Defaults to CUDA if available, otherwise CPU.
-    overwrite : bool
-        If False (default), skip groups that already have ``emb_key``.
     """
     if device is None:
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-    pending = [g for g in groups if overwrite or emb_key not in g]
-    skipped = len(groups) - len(pending)
-    if skipped:
-        print(f"Skipping {skipped} group(s) where '{emb_key}' already exists")
-    if not pending:
-        return
-
     if out_dims == "d e":
-        dataset = UCLA_b_scans(pending, oct_key=oct_key, emb_key=emb_key, out_dims=out_dims)
+        dataset = UCLA_b_scans(groups, oct_key=oct_key, emb_key=emb_key, out_dims=out_dims)
         loader = torch.utils.data.DataLoader(
             dataset,
             batch_size=batch_size,
@@ -244,7 +234,7 @@ def embed_zarr_groups(
                     pbar.update(len(b_indices))
 
     else:  # "e"
-        for group in tqdm(pending, unit="volume", desc="Embedding"):
+        for group in tqdm(groups, unit="volume", desc="Embedding"):
             vol = np.array(group[oct_key])
             emb = embed_volume(model, vol, in_dims, out_dims, batch_size, device, num_workers)
             group[emb_key] = emb

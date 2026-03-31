@@ -1,6 +1,7 @@
 import numpy as np
 import torch
 from PIL import Image
+from tqdm import tqdm
 
 
 def preprocess_bscan(bscan: np.ndarray) -> np.ndarray:
@@ -73,7 +74,7 @@ class UCLA_b_scans(torch.utils.data.Dataset):
         self.num_bscans = np.zeros(len(groups), dtype=int)
         self.bscans = []
 
-        for i, g in enumerate(self.groups):
+        for i, g in tqdm(enumerate(self.groups), desc="Preparing dataset", total=len(self.groups)):
             if self.oct_key not in g:
                 raise KeyError(f"'{self.oct_key}' not found in group {g.name!r}")
             self.num_bscans[i] = g[self.oct_key].shape[1]
