@@ -183,6 +183,65 @@ def embed_volume(
 
 
 # ---------------------------------------------------------------------------
+# Zarr-group-level API
+# ---------------------------------------------------------------------------
+
+def embed_zarr_groups(
+    groups: list[zarr.Group],
+    model: nn.Module,
+    oct_key: str,
+    emb_key: str,
+    depth_axis: int = 0,
+    batch_size: int = 32,
+    device: torch.device | None = None,
+    overwrite: bool = False,
+) -> None:
+    """
+    Embed OCT volumes stored inside zarr groups and write results back in-place.
+
+    For each group, reads the array at ``oct_key``, embeds it with RETFound
+    (mean-pooled across B-scans), and saves a float32 array of shape (1024,)
+    under ``emb_key`` in the same group.
+
+    Parameters
+    ----------
+    groups : list[zarr.Group]
+        Open zarr groups, each containing an OCT volume at ``oct_key``.
+        Groups must be opened with write access (mode "r+" or "a").
+    model : nn.Module
+        Loaded RETFound model (e.g. from ``load_retfound_oct``).
+    oct_key : str
+        Key of the OCT volume array inside each group, e.g. ``"oct"``.
+    emb_key : str
+        Key under which the (1024,) embedding will be written, e.g. ``"oct_emb"``.
+    depth_axis : int
+        Axis of the OCT array that indexes B-scans (default 0).
+    batch_size : int
+        B-scans per forward pass (default 32).
+    device : torch.device, optional
+        Defaults to CUDA if available, otherwise CPU.
+    overwrite : bool
+        If False (default), skip groups that already have ``emb_key``.
+    """
+    if device is None:
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+    for i, group in enumerate(groups):
+        if emb_key in group and not overwrite:
+            print(f"[{i}] skipping – '{emb_key}' already exists")
+            continue
+
+        if oct_key not in group:
+            raise KeyError(f"[{i}] '{oct_key}' not found in group {group.name!r}")
+
+        vol = np.array(group[oct_key])
+        volume_emb, _ = embed_volume(model, vol, depth_axis, batch_size, device)
+
+        group[emb_key] = volume_emb  # writes (1024,) float32 array
+        print(f"[{i}] wrote {emb_key!r} {volume_emb.shape} → {group.name!r}")
+
+
+# ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
 
