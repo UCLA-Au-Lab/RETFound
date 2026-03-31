@@ -38,6 +38,7 @@ import zarr
 from einops import rearrange
 from functools import partial
 from huggingface_hub import hf_hub_download
+from tqdm import tqdm
 
 import models_vit as models
 from ucla_dataset import preprocess_bscan, UCLA_b_scans
@@ -231,21 +232,22 @@ def embed_zarr_groups(
             pin_memory=(device.type == "cuda"),
             collate_fn=_collate_bscans,
         )
+        total_bscans = sum(dataset.num_bscans)
         with torch.no_grad():
-            for b_scans, emb_arrays, b_indices in loader:
-                x = b_scans.to(device)
-                latent = model.forward_features(x.float()).squeeze(1)  # (B, 1024)
-                latent_np = latent.cpu().float().numpy()
-                for emb, arr, b in zip(latent_np, emb_arrays, b_indices.tolist()):
-                    arr[b] = emb
-        print(f"Embedded {len(pending)} volume(s) → '{emb_key}' (D, 1024)")
+            with tqdm(total=total_bscans, unit="b-scan", desc="Embedding") as pbar:
+                for b_scans, emb_arrays, b_indices in loader:
+                    x = b_scans.to(device)
+                    latent = model.forward_features(x.float()).squeeze(1)  # (B, 1024)
+                    latent_np = latent.cpu().float().numpy()
+                    for emb, arr, b in zip(latent_np, emb_arrays, b_indices.tolist()):
+                        arr[b] = emb
+                    pbar.update(len(b_indices))
 
     else:  # "e"
-        for i, group in enumerate(pending):
+        for group in tqdm(pending, unit="volume", desc="Embedding"):
             vol = np.array(group[oct_key])
             emb = embed_volume(model, vol, in_dims, out_dims, batch_size, device, num_workers)
             group[emb_key] = emb
-            print(f"[{i}] wrote '{emb_key}' {emb.shape} → {group.name!r}")
 
 
 # ---------------------------------------------------------------------------
