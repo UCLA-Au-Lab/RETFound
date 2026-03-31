@@ -33,6 +33,7 @@ import os
 import numpy as np
 import torch
 import torch.nn as nn
+import torch.utils.data
 import zarr
 from einops import rearrange
 from functools import partial
@@ -120,44 +121,22 @@ def preprocess_bscan(bscan: np.ndarray) -> np.ndarray:
     return img.astype(np.float32)
 
 
-def bscans_to_tensor(bscans: list[np.ndarray]) -> torch.Tensor:
-    """Stack preprocessed (224,224,3) arrays into (B, 3, 224, 224) tensor."""
-    arr = np.stack(bscans, axis=0)                  # (B, 224, 224, 3)
-    tensor = torch.from_numpy(arr)
-    tensor = tensor.permute(0, 3, 1, 2)             # (B, 3, 224, 224)
-    return tensor
-
-
 # ---------------------------------------------------------------------------
 # Embedding
 # ---------------------------------------------------------------------------
 
-@torch.no_grad()
-def embed_slices(
-    model: nn.Module,
-    slices: list[np.ndarray],
-    batch_size: int,
-    device: torch.device,
-) -> np.ndarray:
-    """
-    Run forward_features on a list of preprocessed B-scans in batches.
+class BscanDataset(torch.utils.data.Dataset):
+    """Wraps a (D, *) volume array; returns preprocessed (3, 224, 224) tensors."""
 
-    Returns
-    -------
-    float32 array of shape (len(slices), 1024)
-    """
-    all_embeddings = []
+    def __init__(self, vol_d_first: np.ndarray) -> None:
+        self.vol = vol_d_first  # (D, *remaining dims)
 
-    for start in range(0, len(slices), batch_size):
-        batch = slices[start : start + batch_size]
-        x = bscans_to_tensor(batch).to(device)      # (B, 3, 224, 224)
+    def __len__(self) -> int:
+        return self.vol.shape[0]
 
-        latent = model.forward_features(x.float())  # (B, 1, 1024) with global_pool
-        latent = latent.squeeze(1)                   # (B, 1024)
-
-        all_embeddings.append(latent.cpu().float().numpy())
-
-    return np.concatenate(all_embeddings, axis=0)   # (D, 1024)
+    def __getitem__(self, idx: int) -> torch.Tensor:
+        arr = preprocess_bscan(self.vol[idx])            # (224, 224, 3) float32
+        return torch.from_numpy(arr).permute(2, 0, 1)   # (3, 224, 224)
 
 
 def embed_volume(
@@ -167,6 +146,7 @@ def embed_volume(
     out_dims: str,
     batch_size: int,
     device: torch.device,
+    num_workers: int = 4,
 ) -> np.ndarray:
     """
     Embed a single 3D OCT volume.
@@ -180,8 +160,12 @@ def embed_volume(
         Must contain ``'d'`` for the B-scan axis.
     out_dims : str
         Desired output shape:
+
         - ``"d e"`` → per-slice embeddings, shape ``(D, 1024)``
         - ``"e"``   → mean-pooled volume embedding, shape ``(1024,)``
+    num_workers : int
+        DataLoader worker processes for parallel B-scan preprocessing (default 4).
+        Set to 0 to preprocess in the main process.
 
     Returns
     -------
@@ -201,9 +185,21 @@ def embed_volume(
     remaining = [a for a in in_axes if a != "d"]
     vol_d_first = rearrange(vol, f'{in_dims} -> d {" ".join(remaining)}')
 
-    num_bscans = vol_d_first.shape[0]
-    slices_preprocessed = [preprocess_bscan(vol_d_first[i]) for i in range(num_bscans)]
-    slice_embs = embed_slices(model, slices_preprocessed, batch_size, device)  # (D, 1024)
+    loader = torch.utils.data.DataLoader(
+        BscanDataset(vol_d_first),
+        batch_size=batch_size,
+        num_workers=num_workers,
+        pin_memory=(device.type == "cuda"),
+    )
+
+    all_embeddings = []
+    with torch.no_grad():
+        for batch in loader:
+            x = batch.to(device)                         # (B, 3, 224, 224)
+            latent = model.forward_features(x.float())   # (B, 1, 1024)
+            all_embeddings.append(latent.squeeze(1).cpu().float().numpy())
+
+    slice_embs = np.concatenate(all_embeddings, axis=0)  # (D, 1024)
 
     if out_axes == ["e"]:
         return slice_embs.mean(axis=0)   # (1024,)
@@ -223,6 +219,7 @@ def embed_zarr_groups(
     in_dims: str = "c d h w",
     out_dims: str = "d e",
     batch_size: int = 32,
+    num_workers: int = 4,
     device: torch.device | None = None,
     overwrite: bool = False,
 ) -> None:
@@ -253,6 +250,9 @@ def embed_zarr_groups(
         - ``"e"``   → mean-pooled, shape ``(1024,)``
     batch_size : int
         B-scans per forward pass (default 32).
+    num_workers : int
+        DataLoader worker processes for parallel B-scan preprocessing (default 4).
+        Set to 0 to preprocess in the main process.
     device : torch.device, optional
         Defaults to CUDA if available, otherwise CPU.
     overwrite : bool
@@ -270,7 +270,7 @@ def embed_zarr_groups(
             raise KeyError(f"[{i}] '{oct_key}' not found in group {group.name!r}")
 
         vol = np.array(group[oct_key])
-        emb = embed_volume(model, vol, in_dims, out_dims, batch_size, device)
+        emb = embed_volume(model, vol, in_dims, out_dims, batch_size, device, num_workers)
 
         group[emb_key] = emb
         print(f"[{i}] wrote {emb_key!r} {emb.shape} → {group.name!r}")
@@ -296,6 +296,8 @@ def parse_args():
                         "(default: 'e')")
     p.add_argument("--batch_size", type=int, default=32,
                    help="Number of B-scans to process per forward pass")
+    p.add_argument("--num_workers", type=int, default=4,
+                   help="DataLoader worker processes for B-scan preprocessing (default: 4)")
     p.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     return p.parse_args()
 
@@ -334,7 +336,7 @@ def main():
         vol = open_zarr_array(path, args.zarr_key)
         print(f"  Volume shape: {vol.shape}  dtype: {vol.dtype}")
 
-        emb = embed_volume(model, vol, args.in_dims, args.out_dims, args.batch_size, device)
+        emb = embed_volume(model, vol, args.in_dims, args.out_dims, args.batch_size, device, args.num_workers)
         print(f"  → embedding: {emb.shape}")
 
         embeddings.append(emb)
