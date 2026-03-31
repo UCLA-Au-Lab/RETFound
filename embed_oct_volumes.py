@@ -13,17 +13,18 @@ Usage
         --zarr_paths /data/vol1.zarr /data/vol2.zarr \
         --output embeddings.npz \
         [--zarr_key 0]           # zarr array key / path inside the store
+        [--in_dims "c d h w"]    # axis names of the OCT array
+        [--out_dims "e"]         # "e" → (1024,) per volume; "d e" → (D, 1024) per volume
         [--batch_size 32]
-        [--save_slice_embeddings] # also save per-slice (D, 1024) arrays
         [--device cuda]
 
 Outputs
 -------
     embeddings.npz  – numpy archive with keys:
-        "volume_embeddings"  : float32 (N, 1024)  – one row per volume
-        "volume_names"       : object  (N,)        – zarr path strings
-        "slice_embeddings"   : float32 (N, D, 1024) (only with --save_slice_embeddings;
-                               zero-padded to max depth if volumes differ in depth)
+        "embeddings"   : float32 – shape (N, 1024) for out_dims="e",
+                                         (N, D, 1024) for out_dims="d e"
+        "volume_names" : object  (N,)   – zarr path strings
+        "out_dims"     : str            – the out_dims used
 """
 
 import argparse
@@ -33,6 +34,7 @@ import numpy as np
 import torch
 import torch.nn as nn
 import zarr
+from einops import rearrange
 from functools import partial
 from huggingface_hub import hf_hub_download
 from PIL import Image
@@ -161,24 +163,52 @@ def embed_slices(
 def embed_volume(
     model: nn.Module,
     vol: np.ndarray,
+    in_dims: str,
+    out_dims: str,
     batch_size: int,
     device: torch.device,
-) -> tuple[np.ndarray, np.ndarray]:
+) -> np.ndarray:
     """
-    Embed a single 3D OCT volume of shape (C, D, H, W).
+    Embed a single 3D OCT volume.
+
+    Parameters
+    ----------
+    vol : np.ndarray
+        Volume array whose axes match ``in_dims``.
+    in_dims : str
+        Einops-style axis names for ``vol``, e.g. ``"c d h w"``.
+        Must contain ``'d'`` for the B-scan axis.
+    out_dims : str
+        Desired output shape:
+        - ``"d e"`` → per-slice embeddings, shape ``(D, 1024)``
+        - ``"e"``   → mean-pooled volume embedding, shape ``(1024,)``
 
     Returns
     -------
-    volume_emb  : float32 (1024,)   – mean-pooled over slices
-    slice_embs  : float32 (D, 1024) – per-slice embeddings
+    np.ndarray with shape matching ``out_dims`` (e = 1024).
     """
-    num_bscans = vol.shape[1]
-    slices_preprocessed = [preprocess_bscan(vol[:, i, :, :]) for i in range(num_bscans)]
+    in_axes = in_dims.split()
+    out_axes = out_dims.split()
 
-    slice_embs = embed_slices(model, slices_preprocessed, batch_size, device)
-    volume_emb = slice_embs.mean(axis=0)
+    if "d" not in in_axes:
+        raise ValueError(f"'d' (B-scan axis) not found in in_dims='{in_dims}'")
+    if "e" not in out_axes:
+        raise ValueError(f"'e' (embedding axis) not found in out_dims='{out_dims}'")
+    if set(out_axes) - {"d", "e"}:
+        raise ValueError(f"out_dims='{out_dims}' contains unknown axes; only 'd' and 'e' are supported")
 
-    return volume_emb, slice_embs
+    # Put d first so we can iterate B-scans: "c d h w" -> "d c h w"
+    remaining = [a for a in in_axes if a != "d"]
+    vol_d_first = rearrange(vol, f'{in_dims} -> d {" ".join(remaining)}')
+
+    num_bscans = vol_d_first.shape[0]
+    slices_preprocessed = [preprocess_bscan(vol_d_first[i]) for i in range(num_bscans)]
+    slice_embs = embed_slices(model, slices_preprocessed, batch_size, device)  # (D, 1024)
+
+    if out_axes == ["e"]:
+        return slice_embs.mean(axis=0)   # (1024,)
+    else:  # ["d", "e"]
+        return slice_embs                # (D, 1024)
 
 
 # ---------------------------------------------------------------------------
@@ -190,6 +220,8 @@ def embed_zarr_groups(
     model: nn.Module,
     oct_key: str,
     emb_key: str,
+    in_dims: str = "c d h w",
+    out_dims: str = "d e",
     batch_size: int = 32,
     device: torch.device | None = None,
     overwrite: bool = False,
@@ -197,22 +229,28 @@ def embed_zarr_groups(
     """
     Embed OCT volumes stored inside zarr groups and write results back in-place.
 
-    For each group, reads the array at ``oct_key`` (shape ``(C, D, H, W)``),
-    embeds it with RETFound (mean-pooled across B-scans), and saves a float32
-    array of shape ``(1024,)`` under ``emb_key`` in the same group.
+    For each group, reads the array at ``oct_key``, embeds it with RETFound,
+    and saves the result under ``emb_key`` in the same group.
 
     Parameters
     ----------
     groups : list[zarr.Group]
         Open zarr groups, each containing an OCT volume at ``oct_key``.
-        Groups must be opened with write access (mode "r+" or "a").
+        Groups must be opened with write access (mode ``"r+"`` or ``"a"``).
     model : nn.Module
         Loaded RETFound model (e.g. from ``load_retfound_oct``).
     oct_key : str
         Key of the OCT volume array inside each group, e.g. ``"oct"``.
-        Array must have shape ``(C, D, H, W)``.
     emb_key : str
-        Key under which the ``(1024,)`` embedding will be written, e.g. ``"oct_emb"``.
+        Key under which the embedding array will be written, e.g. ``"oct_emb"``.
+    in_dims : str
+        Einops-style axis names for the OCT array, e.g. ``"c d h w"``.
+        Must contain ``'d'`` for the B-scan axis.
+    out_dims : str
+        Shape of the written embedding:
+
+        - ``"d e"`` → per-slice, shape ``(D, 1024)``  *(default)*
+        - ``"e"``   → mean-pooled, shape ``(1024,)``
     batch_size : int
         B-scans per forward pass (default 32).
     device : torch.device, optional
@@ -232,10 +270,10 @@ def embed_zarr_groups(
             raise KeyError(f"[{i}] '{oct_key}' not found in group {group.name!r}")
 
         vol = np.array(group[oct_key])
-        volume_emb, _ = embed_volume(model, vol, batch_size, device)
+        emb = embed_volume(model, vol, in_dims, out_dims, batch_size, device)
 
-        group[emb_key] = volume_emb  # writes (1024,) float32 array
-        print(f"[{i}] wrote {emb_key!r} {volume_emb.shape} → {group.name!r}")
+        group[emb_key] = emb
+        print(f"[{i}] wrote {emb_key!r} {emb.shape} → {group.name!r}")
 
 
 # ---------------------------------------------------------------------------
@@ -251,10 +289,13 @@ def parse_args():
     p.add_argument("--zarr_key", default=None,
                    help="Key / path inside each zarr store (e.g. '0' or 'volume'). "
                         "If None, the root array is used.")
+    p.add_argument("--in_dims", default="c d h w",
+                   help="Einops-style axis names for each OCT array (default: 'c d h w')")
+    p.add_argument("--out_dims", default="e",
+                   help="Output shape: 'e' for mean-pooled (1024,) or 'd e' for per-slice (D, 1024) "
+                        "(default: 'e')")
     p.add_argument("--batch_size", type=int, default=32,
                    help="Number of B-scans to process per forward pass")
-    p.add_argument("--save_slice_embeddings", action="store_true",
-                   help="Also save per-slice embeddings (zero-padded to max depth)")
     p.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     return p.parse_args()
 
@@ -285,8 +326,7 @@ def main():
     print("Loading RETFound_mae_natureOCT …")
     model = load_retfound_oct(device)
 
-    volume_embeddings = []
-    slice_embeddings_list = []
+    embeddings = []
     volume_names = []
 
     for path in args.zarr_paths:
@@ -294,32 +334,21 @@ def main():
         vol = open_zarr_array(path, args.zarr_key)
         print(f"  Volume shape: {vol.shape}  dtype: {vol.dtype}")
 
-        vol_emb, slice_embs = embed_volume(
-            model, vol, args.batch_size, device
-        )
-        print(f"  → slice embeddings: {slice_embs.shape}  volume embedding: {vol_emb.shape}")
+        emb = embed_volume(model, vol, args.in_dims, args.out_dims, args.batch_size, device)
+        print(f"  → embedding: {emb.shape}")
 
-        volume_embeddings.append(vol_emb)
-        slice_embeddings_list.append(slice_embs)
+        embeddings.append(emb)
         volume_names.append(path)
 
-    volume_embeddings = np.stack(volume_embeddings, axis=0)  # (N, 1024)
-
     save_dict = {
-        "volume_embeddings": volume_embeddings,
+        "embeddings": np.array(embeddings),
         "volume_names": np.array(volume_names, dtype=object),
+        "out_dims": args.out_dims,
     }
-
-    if args.save_slice_embeddings:
-        max_depth = max(s.shape[0] for s in slice_embeddings_list)
-        padded = np.zeros((len(slice_embeddings_list), max_depth, 1024), dtype=np.float32)
-        for i, s in enumerate(slice_embeddings_list):
-            padded[i, : s.shape[0]] = s
-        save_dict["slice_embeddings"] = padded
 
     np.savez(args.output, **save_dict)
     print(f"\nSaved embeddings to {args.output}")
-    print(f"  volume_embeddings shape: {volume_embeddings.shape}")
+    print(f"  embeddings shape: {np.array(embeddings).shape}")
 
 
 if __name__ == "__main__":
